@@ -8,7 +8,13 @@ Example:
 Y is the dependent asset (NVDA); X is the driver (VOO):
     log_return_Y[t] = alpha[t] + beta[t] * log_return_X[t] + noise[t]
 
-Three estimators run recursively from the first usable return to the last:
+The default rolling model fits ONE beta jointly to the latest --window paired
+one-minute returns, and slides by one usable observation at a time:
+    rY[i] = beta[t] * rX[i] + epsilon[i], i in the trailing window ending at t.
+--fit_intercept optionally adds alpha[t]; --rolling_loss huber downweights outliers.
+
+Four estimators retain their state from the first usable return to the last:
+  rolling:   fixed-length trailing regression (default 120 usable returns).
   kalman:    time-varying alpha/beta, robust update, past-only noise adaptation.
   ewma:      exponentially weighted covariance(X,Y) / variance(X).
   expanding: ordinary least-squares beta using every earlier usable observation.
@@ -33,6 +39,7 @@ import json
 import math
 import re
 import sys
+from collections import deque
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -223,6 +230,106 @@ class KalmanBeta:
         self.noise = max(self.noise_floor, self.noise_decay * self.noise + (1 - self.noise_decay) * squared)
 
 
+class RollingBeta:
+    """One jointly fitted regression for the latest W usable return pairs.
+
+    OLS adds/removes sufficient statistics in constant time. Periodic rebuilding
+    bounds floating-point accumulation. Optional Huber uses only this same window.
+    Returns are scaled to bps; the beta coefficient is unchanged by common scaling.
+    """
+
+    def __init__(self, args: argparse.Namespace):
+        self.window = args.window
+        self.fit_intercept = args.fit_intercept
+        self.loss = args.rolling_loss
+        self.huber_delta = args.rolling_huber_delta
+        self.huber_iterations = args.rolling_huber_iterations
+        self.min_std = args.min_driver_std_bps
+        self.samples: deque[tuple[pd.Timestamp, float, float]] = deque()
+        self.sx = self.sy = self.sxx = self.sxy = self.syy = 0.0
+        self.updates = 0
+        self.beta = self.alpha = self.rmse = self.r2 = self.correlation = self.std_x = math.nan
+        self.beta_before = self.alpha_before = math.nan
+
+    def _accumulate(self, x: float, y: float, sign: float) -> None:
+        self.sx += sign * x
+        self.sy += sign * y
+        self.sxx += sign * x * x
+        self.sxy += sign * x * y
+        self.syy += sign * y * y
+
+    def _weighted_fit(self, x: np.ndarray, y: np.ndarray, weights: np.ndarray) -> tuple[float, float]:
+        if self.fit_intercept:
+            mx, my = float(np.average(x, weights=weights)), float(np.average(y, weights=weights))
+            dx = x - mx
+            denominator = float(np.dot(weights * dx, dx))
+            slope = float(np.dot(weights * dx, y - my)) / max(denominator, EPS)
+            return my - slope * mx, slope
+        denominator = float(np.dot(weights * x, x))
+        return 0.0, float(np.dot(weights * x, y)) / max(denominator, EPS)
+
+    def update(self, timestamp: pd.Timestamp, x: float, y: float) -> None:
+        self.beta_before, self.alpha_before = self.beta, self.alpha
+        if len(self.samples) == self.window:
+            _, old_x, old_y = self.samples.popleft()
+            self._accumulate(old_x, old_y, -1.0)
+        self.samples.append((timestamp, x, y))
+        self._accumulate(x, y, 1.0)
+        self.updates += 1
+        if self.updates % 10_000 == 0:
+            # Rebase entirely on the current window, never on later observations.
+            self.sx = math.fsum(row[1] for row in self.samples)
+            self.sy = math.fsum(row[2] for row in self.samples)
+            self.sxx = math.fsum(row[1] ** 2 for row in self.samples)
+            self.sxy = math.fsum(row[1] * row[2] for row in self.samples)
+            self.syy = math.fsum(row[2] ** 2 for row in self.samples)
+        n = len(self.samples)
+        centered_xx = max(0.0, self.sxx - self.sx * self.sx / n)
+        centered_yy = max(0.0, self.syy - self.sy * self.sy / n)
+        centered_xy = self.sxy - self.sx * self.sy / n
+        self.std_x = math.sqrt(centered_xx / n)
+        self.beta = self.alpha = self.rmse = self.r2 = self.correlation = math.nan
+        if n < self.window or self.std_x < self.min_std:
+            return
+        if self.fit_intercept:
+            slope = centered_xy / max(centered_xx, EPS)
+            intercept = (self.sy - slope * self.sx) / n
+        else:
+            slope, intercept = self.sxy / max(self.sxx, EPS), 0.0
+        if self.loss == "huber":
+            data = np.asarray([(row[1], row[2]) for row in self.samples], dtype=float)
+            xx, yy = data[:, 0], data[:, 1]
+            for _ in range(self.huber_iterations):
+                residual = yy - intercept - slope * xx
+                scale = 1.4826 * float(np.median(np.abs(residual - np.median(residual))))
+                if scale <= EPS:
+                    break
+                cutoff = self.huber_delta * scale
+                weights = np.minimum(1.0, cutoff / np.maximum(np.abs(residual), EPS))
+                new_intercept, new_slope = self._weighted_fit(xx, yy, weights)
+                change = abs(new_slope - slope) + abs(new_intercept - intercept)
+                intercept, slope = new_intercept, new_slope
+                if change <= 1e-8 * (1 + abs(slope) + abs(intercept)):
+                    break
+        self.beta, self.alpha = slope, intercept
+        sse = max(0.0, self.syy + slope * slope * self.sxx + n * intercept * intercept
+                  + 2 * slope * intercept * self.sx - 2 * slope * self.sxy - 2 * intercept * self.sy)
+        self.rmse = math.sqrt(sse / n)
+        # Centered R² is deliberately comparable with a window-mean baseline;
+        # through-origin fits can have negative values, and this is reported as-is.
+        self.r2 = 1 - sse / centered_yy if centered_yy > EPS else math.nan
+        if centered_xx > EPS and centered_yy > EPS:
+            self.correlation = max(-1.0, min(1.0, centered_xy / math.sqrt(centered_xx * centered_yy)))
+
+    @property
+    def start(self) -> str:
+        return self.samples[0][0].isoformat() if self.samples else ""
+
+    @property
+    def end(self) -> str:
+        return self.samples[-1][0].isoformat() if self.samples else ""
+
+
 @dataclass
 class ChangeTracker:
     threshold: float
@@ -263,6 +370,7 @@ class BetaEngine:
         self.kalman = KalmanBeta(args)
         self.ewma = Moments(math.exp(-math.log(2) / args.ewma_half_life))
         self.expanding = Moments()
+        self.rolling = RollingBeta(args)
         self.changes = ChangeTracker(args.change_threshold, args.confirm_bars)
         self.previous: tuple[pd.Timestamp, float, float] | None = None
         self.previous_beta = math.nan
@@ -285,6 +393,7 @@ class BetaEngine:
                 self.kalman.update(rx * 1e4, ry * 1e4)
                 self.ewma.update(rx * 1e4, ry * 1e4)
                 self.expanding.update(rx * 1e4, ry * 1e4)
+                self.rolling.update(timestamp, rx * 1e4, ry * 1e4)
                 self.used += 1
                 used, reason = True, ""
         self.previous = timestamp, px_x, px_y
@@ -293,9 +402,13 @@ class BetaEngine:
         beta_k = self.kalman.beta if self.used else math.nan
         beta_e = self.ewma.beta(self.args.min_driver_std_bps)
         beta_a = self.expanding.beta(self.args.min_driver_std_bps)
-        selected = {"kalman": beta_k, "ewma": beta_e, "expanding": beta_a}[self.args.method]
-        ready = (self.used >= self.args.min_observations and self.ewma.var_x >= self.args.min_driver_std_bps ** 2
-                 and math.isfinite(selected))
+        beta_r = self.rolling.beta
+        selected = {"rolling": beta_r, "kalman": beta_k, "ewma": beta_e, "expanding": beta_a}[self.args.method]
+        if self.args.method == "rolling":
+            ready = math.isfinite(beta_r)
+        else:
+            ready = (self.used >= self.args.min_observations and self.ewma.var_x >= self.args.min_driver_std_bps ** 2
+                     and math.isfinite(selected))
         delta = selected - self.previous_beta if math.isfinite(selected) and math.isfinite(self.previous_beta) else math.nan
         changed, sign, reference, reference_delta = self.changes.update(selected, ready, used)
         minute_moved = bool(ready and used and math.isfinite(delta) and abs(delta) >= self.args.minute_change_threshold)
@@ -304,6 +417,16 @@ class BetaEngine:
             "close_x": px_x, "close_y": px_y, "gap_minutes": gap,
             "observation_used": int(used), "skip_reason": reason, "observations_so_far": self.used,
             "return_x_log": rx, "return_y_log": ry,
+            "beta_rolling": beta_r, "beta_rolling_before_update": self.rolling.beta_before if used else beta_r,
+            "alpha_rolling_bps": self.rolling.alpha,
+            "alpha_rolling_before_update_bps": self.rolling.alpha_before if used else self.rolling.alpha,
+            "rolling_window_observations": len(self.rolling.samples),
+            "rolling_window_start": self.rolling.start, "rolling_window_end": self.rolling.end,
+            "rolling_driver_std_bps": self.rolling.std_x,
+            "rolling_rmse_bps": self.rolling.rmse, "rolling_r2_centered": self.rolling.r2,
+            "rolling_correlation": self.rolling.correlation,
+            "rolling_residual_bps": (ry * 1e4 - self.rolling.alpha - beta_r * rx * 1e4)
+                if used and math.isfinite(beta_r) else math.nan,
             "beta_kalman": beta_k, "beta_kalman_before_update": self.kalman.last_prior if used else beta_k,
             "alpha_kalman_bps": self.kalman.alpha, "beta_kalman_sd": math.sqrt(self.kalman.p11),
             "kalman_innovation_bps": self.kalman.last_innovation if used else math.nan,
@@ -321,7 +444,7 @@ class BetaEngine:
         return row
 
 
-PLOT_FIELDS = ("timestamp", "bar_index", "close_x", "close_y", "beta", "beta_ready", "beta_delta",
+PLOT_FIELDS = ("timestamp", "bar_index", "close_x", "close_y", "beta", "beta_ready", "beta_delta", "beta_rolling",
                "beta_kalman", "beta_kalman_sd", "beta_ewma", "beta_expanding", "beta_change_direction")
 
 
@@ -379,15 +502,22 @@ def make_plot(frame: pd.DataFrame, events: list[dict], args: argparse.Namespace,
     axes[0].set_ylabel("Price (first bar = 100)")
     axes[0].legend(loc="upper left", ncol=2)
     primary = frame["beta"].to_numpy(dtype=float)
-    axes[1].plot(x, np.where(~ready, primary, np.nan), color="#149393", ls=":", lw=1.2, label="Initial / insufficient-data estimate")
-    axes[1].plot(x, np.where(ready, primary, np.nan), color="#078080", lw=1.9, label=f"{args.method.capitalize()} beta (selected)")
+    if args.method == "rolling":
+        model_label = f"Rolling {args.rolling_loss.upper()} beta · {args.window} returns"
+        if args.fit_intercept:
+            model_label += " · fitted intercept"
+    else:
+        model_label = f"{args.method.capitalize()} beta (selected)"
+        axes[1].plot(x, np.where(~ready, primary, np.nan), color="#149393", ls=":", lw=1.2, label="Initial / insufficient-data estimate")
+    axes[1].plot(x, np.where(ready, primary, np.nan), color="#078080", lw=1.9, label=model_label)
     if args.method == "kalman":
         sd = frame["beta_kalman_sd"].to_numpy(dtype=float)
         axes[1].fill_between(x, np.where(ready, primary - 1.96 * sd, np.nan),
                              np.where(ready, primary + 1.96 * sd, np.nan), color="#078080", alpha=.12,
                              label="Approx. model band (±1.96 SD)")
     if args.compare:
-        for name, column, color in [("Kalman", "beta_kalman", "#078080"), ("EWMA", "beta_ewma", "#de8b27"),
+        for name, column, color in [(f"Rolling {args.window}", "beta_rolling", "#955cb2"),
+                                    ("Kalman", "beta_kalman", "#40a7ad"), ("EWMA", "beta_ewma", "#de8b27"),
                                     ("Since-start OLS", "beta_expanding", "#858590")]:
             if column != "beta_" + args.method:
                 axes[1].plot(x, np.where(ready, frame[column].to_numpy(dtype=float), np.nan), color=color, lw=1.0, alpha=.8, label=name)
@@ -423,7 +553,8 @@ def make_plot(frame: pd.DataFrame, events: list[dict], args: argparse.Namespace,
     for ax in axes:
         ax.grid(alpha=.18)
         ax.spines[["top", "right"]].set_visible(False)
-    fig.suptitle(f"{args.ticker_y} / {args.ticker_x} · continuous causal beta · no daily reset", fontsize=15)
+    title_model = f"rolling {args.window}-return {args.rolling_loss.upper()}" if args.method == "rolling" else args.method
+    fig.suptitle(f"{args.ticker_y} / {args.ticker_x} · {title_model} beta · no daily reset", fontsize=15)
     fig.text(.01, .005, f"Persistent change: |beta − last confirmed level| ≥ {args.change_threshold:g}, "
              f"for {args.confirm_bars} usable bars. Plot sampling only; CSV retains every matched bar.", fontsize=8, color="#555555")
     fig.tight_layout(rect=[0, .02, 1, .96])
@@ -445,7 +576,8 @@ def make_html(frame: pd.DataFrame, events: list[dict], args: argparse.Namespace,
         fig.add_trace(go.Scattergl(x=x, y=frame[column] / price * 100, name=name), row=1, col=1)
     columns = [("beta_" + args.method, args.method.capitalize())]
     if args.compare:
-        columns += [(c, n) for c, n in [("beta_kalman", "Kalman"), ("beta_ewma", "EWMA"), ("beta_expanding", "Since-start OLS")] if c != columns[0][0]]
+        columns += [(c, n) for c, n in [("beta_rolling", f"Rolling {args.window}"), ("beta_kalman", "Kalman"),
+                                       ("beta_ewma", "EWMA"), ("beta_expanding", "Since-start OLS")] if c != columns[0][0]]
     for column, name in columns:
         fig.add_trace(go.Scattergl(x=x, y=frame[column], name=name + " beta"), row=2, col=1)
     if events:
@@ -473,8 +605,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session", choices=["all", "rth"], default="all", help="all=all supplied bars; rth=09:30 ≤ time < 16:00 in market_tz")
     p.add_argument("--start", default=None, help="First file date, inclusive, YYYY-MM-DD")
     p.add_argument("--end", default=None, help="Last file date, inclusive, YYYY-MM-DD")
-    p.add_argument("--method", choices=["kalman", "ewma", "expanding"], default="kalman")
-    p.add_argument("--compare", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--method", choices=["rolling", "kalman", "ewma", "expanding"], default="rolling")
+    p.add_argument("--window", "--window_bars", type=int, default=120, help="Latest W usable return pairs in each rolling fit")
+    p.add_argument("--fit_intercept", action=argparse.BooleanOptionalAction, default=False,
+                   help="Add alpha to rolling regression; default fits exactly rY = beta*rX + epsilon")
+    p.add_argument("--rolling_loss", choices=["ols", "huber"], default="ols")
+    p.add_argument("--rolling_huber_delta", type=float, default=1.345)
+    p.add_argument("--rolling_huber_iterations", type=int, default=20)
+    p.add_argument("--compare", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--beta_prior", type=float, default=1.0, help="Initial Kalman beta guess, not a fitted first-bar beta")
     p.add_argument("--beta_prior_sd", type=float, default=2.0)
     p.add_argument("--kalman_q_beta", "--kalman-q-beta", type=float, default=1e-5, help="Beta random-walk variance per usable return; smaller is steadier")
@@ -484,7 +622,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--noise_half_life", type=float, default=120.0, help="Past-only Kalman measurement-noise adaptation half-life")
     p.add_argument("--huber_z", type=float, default=4.0, help="Inflate measurement noise for large innovations; 0 disables")
     p.add_argument("--ewma_half_life", "--ewma-half-life", type=float, default=240.0, help="EWMA half-life in usable observations, not calendar minutes")
-    p.add_argument("--min_observations", type=int, default=120, help="Initial estimates remain available but beta_ready=0 until this count")
+    p.add_argument("--min_observations", type=int, default=120,
+                   help="Warmup for non-rolling methods; rolling readiness uses --window")
     p.add_argument("--min_driver_std_bps", type=float, default=.1, help="Low-X-variation guard for beta availability/readiness")
     p.add_argument("--gap_policy", choices=["skip", "include"], default="skip", help="skip=use only one-minute returns; include=also model multi-minute/overnight returns")
     p.add_argument("--minute_tolerance", type=float, default=.05, help="Tolerance around a one-minute timestamp gap")
@@ -514,7 +653,7 @@ def validate(args: argparse.Namespace) -> None:
         raise ValueError("Supply --x_dir and --y_dir, or --data_root with ticker subfolders.")
     args.x_dir, args.y_dir = args.x_dir.expanduser().resolve(), args.y_dir.expanduser().resolve()
     args.out_dir = args.out_dir.expanduser().resolve()
-    for name in ["beta_prior_sd", "initial_noise_bps", "noise_floor_bps", "noise_half_life", "ewma_half_life",
+    for name in ["beta_prior_sd", "initial_noise_bps", "noise_floor_bps", "noise_half_life", "ewma_half_life", "rolling_huber_delta",
                  "min_driver_std_bps", "minute_change_threshold", "change_threshold"]:
         v = getattr(args, name)
         if not math.isfinite(v) or v <= 0:
@@ -527,6 +666,8 @@ def validate(args: argparse.Namespace) -> None:
         raise ValueError("--beta_prior must be finite.")
     if args.min_observations < 2 or args.confirm_bars < 1 or args.max_plot_points < 0 or args.print_every < 0:
         raise ValueError("min_observations ≥ 2, confirm_bars ≥ 1, max_plot_points ≥ 0, print_every ≥ 0 required.")
+    if args.window < 3 or args.rolling_huber_iterations < 1:
+        raise ValueError("--window must be ≥ 3 and --rolling_huber_iterations must be ≥ 1.")
     for value in [args.start, args.end]:
         if value:
             date.fromisoformat(value)
@@ -618,12 +759,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                "rows_without_filter_update": engine.skipped, "confirmed_beta_changes": engine.changes.events,
                "final_beta": last_row["beta"], "final_beta_ready": bool(last_row["beta_ready"]),
                "final_beta_kalman": last_row["beta_kalman"], "final_beta_ewma": last_row["beta_ewma"],
-               "final_beta_expanding": last_row["beta_expanding"], "plot_stride": plot.stride,
+               "final_beta_expanding": last_row["beta_expanding"], "final_beta_rolling": last_row["beta_rolling"],
+               "rolling_window": args.window, "rolling_loss": args.rolling_loss,
+               "rolling_fit_intercept": args.fit_intercept, "plot_stride": plot.stride,
                "parameters": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                "notes": ["Beta is a return coefficient, not the price ratio.",
-                         "All three estimators retain state across paired days.",
+                         "All four estimators retain state across paired days.",
+                         "Rolling fits use exactly the latest window usable return pairs, including the current one.",
+                         "The rolling window counts usable observations, not wall-clock minutes; gaps are skipped by default.",
+                         "Rolling readiness requires a complete window and sufficient within-window X variation.",
                          "EWMA/Kalman adapt over time; expanding OLS weights all usable history equally.",
                          "beta_ready=0 marks initial or low-driver-variation estimates.",
+                         "rolling_residual_bps is an in-window fitted residual, not an out-of-sample forecast error.",
                          "beta_changed is a persistence/threshold heuristic, not a statistical hypothesis test.",
                          "Kalman uncertainty bands are approximate model bands.",
                          "No price filling, no full-day variance calibration, no backward smoothing."]}

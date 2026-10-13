@@ -172,5 +172,100 @@ class TimelineTests(unittest.TestCase):
             self.assertTrue(result.timestamp.is_monotonic_increasing)
 
 
+class RollingTests(unittest.TestCase):
+    def test_each_window_matches_direct_zero_intercept_regression(self):
+        rng = np.random.default_rng(302)
+        x = rng.normal(1.0, 3, 100)
+        y = .2 + 1.7 * x + rng.normal(0, .8, 100)
+        window = 12
+        model = beta.RollingBeta(arguments(window=window, fit_intercept=False))
+        times = pd.date_range("2025-01-02 14:30", periods=len(x), freq="min", tz="UTC")
+        for i, (ts, xx, yy) in enumerate(zip(times, x, y)):
+            model.update(ts, float(xx), float(yy))
+            if i < window - 1:
+                self.assertTrue(math.isnan(model.beta))
+            else:
+                xw, yw = x[i - window + 1:i + 1], y[i - window + 1:i + 1]
+                expected = float(xw @ yw / (xw @ xw))
+                self.assertAlmostEqual(model.beta, expected, places=11)
+                self.assertEqual(model.alpha, 0.0)
+                self.assertAlmostEqual(model.rmse, float(np.sqrt(np.mean((yw - expected * xw) ** 2))), places=10)
+                self.assertEqual(model.start, times[i - window + 1].isoformat())
+                self.assertEqual(model.end, ts.isoformat())
+
+    def test_optional_intercept_matches_direct_ols(self):
+        rng = np.random.default_rng(303)
+        x = rng.normal(2.0, 3, 90)
+        y = 1.1 + 1.9 * x + rng.normal(0, .2, 90)
+        window = 20
+        model = beta.RollingBeta(arguments(window=window, fit_intercept=True))
+        for i, (xx, yy) in enumerate(zip(x, y)):
+            model.update(pd.Timestamp("2025-01-02", tz="UTC") + pd.Timedelta(minutes=i), float(xx), float(yy))
+            if i >= window - 1:
+                xw, yw = x[i - window + 1:i + 1], y[i - window + 1:i + 1]
+                intercept, slope = np.linalg.lstsq(np.column_stack([np.ones(window), xw]), yw, rcond=None)[0]
+                self.assertAlmostEqual(model.beta, slope, places=11)
+                self.assertAlmostEqual(model.alpha, intercept, places=11)
+
+    def test_old_samples_are_removed_exactly(self):
+        model = beta.RollingBeta(arguments(window=5))
+        x = [1., 2., 3., 4., 5.] * 2
+        slopes = [1.] * 5 + [3.] * 5
+        for i, (xx, slope) in enumerate(zip(x, slopes)):
+            model.update(pd.Timestamp("2025-01-02", tz="UTC") + pd.Timedelta(minutes=i), xx, slope * xx)
+        self.assertEqual(len(model.samples), 5)
+        self.assertAlmostEqual(model.beta, 3.)
+        self.assertAlmostEqual(model.rmse, 0.)
+
+    def test_rolling_window_survives_overnight_without_new_gap_sample(self):
+        engine = beta.BetaEngine(arguments(window=4, method="rolling"))
+        times = pd.date_range("2025-01-02 14:30", periods=5, freq="min", tz="UTC")
+        for i, ts in enumerate(times):
+            last = engine.step(ts, 500 + i * i, 150 + i * i, "2025-01-02")
+        self.assertEqual(last["rolling_window_observations"], 4)
+        self.assertEqual(last["beta_ready"], 1)
+        gap = engine.step(pd.Timestamp("2025-01-03 14:30", tz="UTC"), 600., 200., "2025-01-03")
+        self.assertEqual(gap["rolling_window_observations"], 4)
+        self.assertEqual(gap["beta"], last["beta"])
+        self.assertEqual(gap["rolling_window_start"], last["rolling_window_start"])
+        after = engine.step(pd.Timestamp("2025-01-03 14:31", tz="UTC"), 600.3, 200.2, "2025-01-03")
+        self.assertEqual(after["rolling_window_start"], times[2].isoformat())
+        self.assertEqual(after["rolling_window_end"], "2025-01-03T14:31:00+00:00")
+
+    def test_huber_window_downweights_a_single_large_outlier(self):
+        rng = np.random.default_rng(305)
+        x = rng.normal(0, 3, 80)
+        y = 1.6 * x + rng.normal(0, .08, 80)
+        y[np.argmax(np.abs(x))] += 200
+        ols = beta.RollingBeta(arguments(window=80, rolling_loss="ols"))
+        robust = beta.RollingBeta(arguments(window=80, rolling_loss="huber"))
+        for i, (xx, yy) in enumerate(zip(x, y)):
+            ts = pd.Timestamp("2025-01-02", tz="UTC") + pd.Timedelta(minutes=i)
+            ols.update(ts, float(xx), float(yy))
+            robust.update(ts, float(xx), float(yy))
+        self.assertLess(abs(robust.beta - 1.6), .05)
+        self.assertLess(abs(robust.beta - 1.6), abs(ols.beta - 1.6) / 10)
+
+    def test_flat_driver_window_invalidates_previously_ready_estimate(self):
+        model = beta.RollingBeta(arguments(window=4))
+        for i, xx in enumerate([1., 2., 3., 4., 0., 0., 0., 0.]):
+            model.update(pd.Timestamp("2025-01-02", tz="UTC") + pd.Timedelta(minutes=i), xx, 2 * xx)
+            if i == 3:
+                self.assertAlmostEqual(model.beta, 2.)
+        self.assertTrue(math.isnan(model.beta))
+
+    def test_periodic_rebase_preserves_the_current_window_fit(self):
+        rng = np.random.default_rng(306)
+        model = beta.RollingBeta(arguments(window=40, fit_intercept=True))
+        for i in range(10_020):
+            xx = float(rng.normal(2, 3))
+            yy = 1.2 + 1.5 * xx + float(rng.normal(0, .5))
+            model.update(pd.Timestamp("2025-01-02", tz="UTC") + pd.Timedelta(minutes=i), xx, yy)
+        data = np.asarray([(v[1], v[2]) for v in model.samples])
+        intercept, slope = np.linalg.lstsq(np.column_stack([np.ones(40), data[:, 0]]), data[:, 1], rcond=None)[0]
+        self.assertAlmostEqual(model.beta, slope, places=11)
+        self.assertAlmostEqual(model.alpha, intercept, places=11)
+
+
 if __name__ == "__main__":
     unittest.main()

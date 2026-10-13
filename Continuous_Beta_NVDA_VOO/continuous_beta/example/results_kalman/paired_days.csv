@@ -1,0 +1,2 @@
+day,status,x_file,y_file,aligned_bars,x_clean_bars,y_clean_bars,x_unmatched_bars,y_unmatched_bars,x_raw,x_invalid,x_duplicates,x_session_filtered,y_raw,y_invalid,y_duplicates,y_session_filtered,usable_returns
+2025-07-25,paired,/workspace/scratch/8f78cddfdc40/continuous_beta/example/input/VOO/VOO_2025-07-25_1min.csv,/workspace/scratch/8f78cddfdc40/continuous_beta/example/input/NVDA/NVDA_2025-07-25_1min.csv,496,496,496,0,0,496,0,0,0,496,0,0,0,430

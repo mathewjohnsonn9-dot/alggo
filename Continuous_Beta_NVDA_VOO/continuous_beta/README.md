@@ -2,9 +2,19 @@
 
 This script pairs daily files from two folders, aligns their timestamps, and plots a single beta timeline from the first paired file to the last. It keeps all estimator state across days. Days present in only one folder are reported and skipped.
 
-The model is:
+**Update: the default is now rolling-window regression**, with a 120-return window. The previous Kalman, EWMA, and since-start OLS methods remain available through `--method`.
 
-`NVDA log return = alpha + beta × VOO log return + residual`
+The default model within each trailing window is exactly:
+
+`NVDA log return[i] = beta[t] × VOO log return[i] + epsilon[i]`
+
+All 120 paired one-minute returns in that window contribute to ONE fitted beta. At the next usable minute, the oldest return pair leaves, the newest pair enters, and the regression is fitted again. The fitted coefficient is aligned to the end of the window; no future return enters an earlier fit.
+
+For ordinary least squares with the requested zero intercept:
+
+`beta[t] = sum(r_voo[i] * r_nvda[i]) / sum(r_voo[i]**2)`
+
+The sums run over the current trailing window. Add `--fit_intercept` to instead fit `r_nvda[i] = alpha[t] + beta[t] * r_voo[i] + epsilon[i]`.
 
 Beta is a relationship between returns, not `NVDA price / VOO price`. A beta near 2 means an approximately twofold modeled return response to VOO. It does not mean NVDA costs twice as much, nor does it promise a reversal or a profitable trade.
 
@@ -20,6 +30,8 @@ python continuous_beta.py \
   --y_dir /home/fariborz/Downloads/live/test_stock/NVDA \
   --ticker_x VOO \
   --ticker_y NVDA \
+  --method rolling \
+  --window 120 \
   --out_dir beta_results \
   --show
 ```
@@ -49,17 +61,28 @@ To restrict both assets to 09:30–15:59 Eastern, add `--session rth`. The defau
 
 By default, only returns between consecutive timestamps approximately one minute apart update beta. The first price of a day after an overnight gap anchors the next return while retaining the previous filter state. Missing intraday minutes and skipped unpaired days similarly leave the model intact and skip the spanning return. Thus overnight price moves are not mislabeled as one-minute returns. You can explicitly include multi-minute/overnight returns with `--gap_policy include`; their durations then differ from the minute observations.
 
-**Three lines on the same timeline**
+**Window length and fitting method**
+
+The window counts the latest W usable paired returns, not W wall-clock minutes. `--window 60` fits approximately one trading hour; `--window 120` fits approximately two trading hours. Missing minutes are skipped, and the window carries across day boundaries. It is not cleared at the market close. `rolling_window_start` and `rolling_window_end` in the CSV identify the actual oldest and newest return timestamps, which may span an overnight/weekend gap.
+
+The first beta appears once the window is complete. Earlier rows are still written with unavailable rolling coefficients and `beta_ready=0`. A window with nearly constant VOO returns is also marked unavailable rather than dividing by a tiny denominator. The previous `--min_observations` flag applies to the non-rolling methods; rolling readiness uses the selected window size.
+
+Default fitting is ordinary least squares (`--rolling_loss ols`). To reduce the effect of isolated large residuals, use `--rolling_loss huber`. Huber fits the same window using residual-dependent weights, retaining the zero-intercept model unless `--fit_intercept` is supplied. It costs more computation than OLS and cannot guarantee a smoother curve for every dataset.
+
+Fitting a larger sample can stabilize estimation, but it does not establish that the relationship is linear. Larger windows also take longer to reflect a changed relationship. Window RMSE, correlation, and centered R² are recorded to help inspect the fit. They describe the current fitted sample, not forecast accuracy or trading profitability.
+
+**Available estimates and comparisons**
 
 | Line | Meaning |
 |---|---|
-| Kalman, selected by default | An evolving alpha/beta estimate. Each available return updates the previous state; large unexplained returns are downweighted. |
+| Rolling, selected by default | One beta jointly fitted to the latest W return pairs. Fits the requested zero-intercept equation unless `--fit_intercept` is enabled. |
+| Kalman | An evolving alpha/beta estimate. Each available return updates the previous state; large unexplained returns are downweighted. |
 | EWMA | Covariance/variance estimate with an exponentially decaying history. Default half-life is 240 usable observations. This is an EWMA estimator, not a fitted DCC-GARCH model. |
 | Since-start OLS | A full-history regression beta. Every usable return since the first day has equal weight. It is a useful anchor, although old observations eventually make it slow to respond. |
 
-Change the primary method with `--method ewma` or `--method expanding`. Use `--no-compare` to hide the other two lines. Kalman noise estimates use only already observed data. The code never fits the entire evaluation day to initialize earlier observations, never smooths backward, and never resets at a day boundary.
+Change the primary method with `--method kalman`, `--method ewma`, or `--method expanding`. The default plot shows only the selected rolling estimate; add `--compare` to include the other methods. The comparison methods fit an intercept, while rolling uses your zero-intercept formula by default. Kalman noise estimates use only already observed data. The code never fits the entire evaluation day to initialize earlier observations, never smooths backward, and never resets at a day boundary.
 
-The first 120 usable returns are marked as initial estimates (`beta_ready=0`), but they are still written and the selected estimate is plotted as a dotted line. The first price has no earlier return and therefore no estimated beta. A nearly constant driver also produces `beta_ready=0`. The count is cumulative across paired days; it does not require 120 new observations every morning. This is an availability/variation guard, not proof of statistical significance. Kalman shaded bands are approximate model uncertainty bands (±1.96 model standard deviations), not guaranteed coverage intervals.
+For the non-rolling methods, the first 120 usable returns are marked as initial estimates (`beta_ready=0`), but they are still written and the selected estimate is plotted as a dotted line. The first price has no earlier return and therefore no estimated beta. A nearly constant driver also produces `beta_ready=0`. The count is cumulative across paired days; it does not require 120 new observations every morning. This is an availability/variation guard, not proof of statistical significance. When Kalman is selected, its shaded bands are approximate model uncertainty bands (±1.96 model standard deviations), not guaranteed coverage intervals.
 
 **Does beta change each minute?**
 
@@ -68,6 +91,13 @@ The CSV contains both the exact estimated movement and two useful flags:
 | Column | Meaning |
 |---|---|
 | `beta` | Selected estimate using data available through this timestamp. |
+| `beta_rolling` | Coefficient jointly fitted to the latest complete window. |
+| `alpha_rolling_bps` | Fitted intercept in basis points; exactly zero by default once a window is ready. |
+| `beta_rolling_before_update` / `alpha_rolling_before_update_bps` | Window coefficients available before observing the current return. |
+| `rolling_window_observations` | Number of usable return pairs currently in the window, up to W. |
+| `rolling_window_start` / `rolling_window_end` | End timestamps of the oldest/newest one-minute returns used in the window. |
+| `rolling_rmse_bps` / `rolling_r2_centered` / `rolling_correlation` | Window fit diagnostics. Centered R² can be negative for a zero-intercept fit; it uses the window-mean baseline. |
+| `rolling_residual_bps` | Current return minus the current window's fitted value. It is an in-window residual. |
 | `beta_delta` | `beta[t] − beta[t−1]`. |
 | `beta_moved_this_minute` | 1 if the estimate is ready, the return was usable, and the absolute one-bar movement is at least 0.01 by default. |
 | `beta_changed` | 1 when beta has stayed at least 0.10 away from the last confirmed level for three consecutive usable bars, in the same direction. This catches accumulated drift as well as larger jumps. |
@@ -91,7 +121,10 @@ To print every matched minute while processing, add `--print_every 1`. Every min
 
 **Make it steadier or more responsive**
 
-- Steadier Kalman beta: reduce `--kalman_q_beta` from its default `0.00001` to `0.000001`.
+- Longer rolling window: increase `--window` to `240` or `390` for a longer fitting history.
+- Shorter rolling window: reduce `--window` to `30` or `60` for faster adaptation.
+- Rolling outlier weighting: use `--rolling_loss huber`.
+- Steadier Kalman beta (when `--method kalman`): reduce `--kalman_q_beta` from its default `0.00001` to `0.000001`.
 - Faster Kalman beta: increase `--kalman_q_beta` to `0.0001`.
 - Steadier EWMA: increase `--ewma_half_life` from `240` to `780`.
 - Faster EWMA: reduce `--ewma_half_life` to `60`.
@@ -122,13 +155,13 @@ Historical ranges can be restricted with `--start 2024-01-01 --end 2025-12-31`. 
 
 **Verification**
 
-The included unittest checks cover exact agreement with batch OLS/EWMA, invariance of earlier output when future data changes, state continuity across overnight gaps and unmatched days, missing-minute handling, constant-driver protection, known synthetic beta changes, robust outlier weighting, timezone/epoch equivalence, and change persistence.
+The included 19 unittest checks cover exact agreement of each rolling window with direct OLS (with and without an intercept), removal of expired samples, periodic numerical rebuilding, Huber outlier weighting, batch OLS/EWMA agreement, invariance of earlier output when future data changes, continuity across overnight gaps and unmatched days, missing-minute handling, constant-driver protection, known synthetic beta changes, timezone/epoch equivalence, and change persistence.
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The `example/` folder contains a one-day demonstration reconstructed from the VOO/NVDA price columns in your uploaded `long_only_beta_runs/run1/live_state.csv` (July 25, 2025). Its naive timestamps were interpreted as UTC for the demonstration. It is not the requested full multi-day folder run; use your folders to produce that timeline.
+The `example/` folder contains a one-day demonstration reconstructed from the VOO/NVDA price columns in your uploaded `long_only_beta_runs/run1/live_state.csv` (July 25, 2025). Its naive timestamps were interpreted as UTC for the demonstration. `example/results/` now shows the 120-return rolling model; `example/results_kalman/` retains the previous Kalman demonstration. This is not the requested full multi-day folder run; use your folders to produce that timeline.
 
 You can reproduce the demonstration with:
 
@@ -136,4 +169,4 @@ You can reproduce the demonstration with:
 python continuous_beta.py --data_root example/input --out_dir example_output
 ```
 
-For background on expanding regression through a Kalman filter, see the [statsmodels RecursiveLS documentation](https://www.statsmodels.org/stable/generated/statsmodels.regression.recursive_ls.RecursiveLS.html). Full DCC-GARCH has a different covariance-estimation structure; see [Engle and Sheppard's paper](https://www.nber.org/papers/w8554). The estimator implementations here use NumPy/Pandas and do not require statsmodels, PyTorch, or GARCH fitting.
+For the rolling-window concept and endpoint alignment, see the [statsmodels Rolling Regression documentation](https://www.statsmodels.org/stable/examples/notebooks/generated/rolling_ls.html). For expanding regression through a Kalman filter, see [RecursiveLS](https://www.statsmodels.org/stable/generated/statsmodels.regression.recursive_ls.RecursiveLS.html). Full DCC-GARCH has a different covariance-estimation structure; see [Engle and Sheppard's paper](https://www.nber.org/papers/w8554). The estimator implementations here use NumPy/Pandas and do not require statsmodels, PyTorch, or GARCH fitting.
